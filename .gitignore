@@ -23,7 +23,7 @@ dist/
 *.npz
 *.vtp
 *.vtu
-*.stl
+#*.stl
 *.png
 *.svg
 *.eps
