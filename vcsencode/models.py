@@ -125,30 +125,24 @@ class RadiusSurfaceBSpline:
     coeffs: np.ndarray        # shape (K, R) spline coefficients
     theta_periodic: bool = True
 
-    def _basis_all(self, u: float, k: int, knots: np.ndarray) -> np.ndarray:
-        """Evaluate all order-``k`` basis functions at parameter ``u``."""
-        t = np.asarray(knots, dtype=float)
-        n = t.size - k - 1
+    def _basis_values(self, u: float, degree: int, knots: np.ndarray, cache_attr: str) -> np.ndarray:
+        """Evaluate all basis functions at parameter ``u`` using cached splines."""
+
+        splines = getattr(self, cache_attr, None)
+        if splines is None:
+            n_basis = len(knots) - degree - 1
+            splines = []
+            for idx in range(n_basis):
+                coeff = np.zeros(n_basis, dtype=float)
+                coeff[idx] = 1.0
+                splines.append(BSpline(knots, coeff, degree, extrapolate=False))
+            setattr(self, cache_attr, splines)
+
         u = float(u)
-        u = max(t[k], min(u, t[n]))
-        if abs(u - t[n]) < 1e-12:
-            u = t[n] - 1e-12
-        # Cox–de Boor recursion storing all degrees
-        N = np.zeros((k + 1, n), dtype=float)
-        mask = (t[:-1] <= u) & (u < t[1:])
-        N[0, mask] = 1.0
-        for d in range(1, k + 1):
-            for j in range(n):
-                left = 0.0
-                right = 0.0
-                denom1 = t[j + d] - t[j]
-                denom2 = t[j + d + 1] - t[j + 1]
-                if denom1 > 0.0:
-                    left = (u - t[j]) / denom1 * N[d - 1, j]
-                if denom2 > 0.0 and j + 1 < n:
-                    right = (t[j + d + 1] - u) / denom2 * N[d - 1, j + 1]
-                N[d, j] = left + right
-        return N[k]
+        values = np.empty(len(splines), dtype=float)
+        for idx, spline in enumerate(splines):
+            values[idx] = float(spline(u))
+        return values
 
     def rho(self, tau: float, theta: float) -> float:
         """Evaluate ρ_w(tau, theta) using either LSQ spline or basis expansion."""
@@ -160,8 +154,8 @@ class RadiusSurfaceBSpline:
         spl = getattr(self, "_spl", None)
         if spl is not None:
             return float(spl.ev(t, th))
-        Bt = self._basis_all(t, self.k_tau, self.knots_tau)
-        Bth = self._basis_all(th, self.k_theta, self.knots_theta)
+        Bt = self._basis_values(t, self.k_tau, self.knots_tau, "_basis_tau")
+        Bth = self._basis_values(th, self.k_theta, self.knots_theta, "_basis_theta")
         return float(Bt @ self.coeffs @ Bth)
 
     def eval_grid(self, T: np.ndarray, Theta: np.ndarray) -> np.ndarray:
@@ -175,8 +169,8 @@ class RadiusSurfaceBSpline:
         if spl is not None:
             TT, TH = np.meshgrid(T, Theta, indexing="ij")
             return spl.ev(TT.ravel(), TH.ravel()).reshape(TT.shape)
-        BT = np.stack([self._basis_all(t, self.k_tau, self.knots_tau) for t in T], axis=0)
-        BTH = np.stack([self._basis_all(th, self.k_theta, self.knots_theta) for th in Theta], axis=0)
+        BT = np.stack([self._basis_values(t, self.k_tau, self.knots_tau, "_basis_tau") for t in T], axis=0)
+        BTH = np.stack([self._basis_values(th, self.k_theta, self.knots_theta, "_basis_theta") for th in Theta], axis=0)
         return BT @ self.coeffs @ BTH.T
 
 

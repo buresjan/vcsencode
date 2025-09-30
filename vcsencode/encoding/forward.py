@@ -6,20 +6,38 @@ Forward VCS encoding:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Optional
 import warnings
+import logging
+from math import tau as TWO_PI
 import numpy as np
-from scipy.interpolate import LSQBivariateSpline
+from scipy.interpolate import BSpline
 
 from ..models import Mesh3D, CenterlineBSpline, RMF, RadiusSurfaceBSpline, VCSModel
 from ..geom.rays import cast_radius
 from ..geom.frames import compute_rmf
+from ..geom.periodic import periodic_theta_basis_matrix
+try:
+    from ..geom.checks import check_tau_uniqueness  # requires SciPy
+except Exception:  # ImportError or runtime issues
+    check_tau_uniqueness = None
 from ..io import clean_mesh, detect_caps, cap_centers, inward_seed_points, cap_surface_seed_points
 from ..geom.padding import pad_mesh_ends
 from ..geom.projection import closest_point_tau
 from .crop import crop_and_refit
 from ..centerline import compute_centerline_vmtk, extend_to_cap_centers, fit_centerline_bspline
+
+log = logging.getLogger(__name__)
+
+
+def _v1_from_mesh_centroid(cl: CenterlineBSpline, mesh: Mesh3D) -> np.ndarray | None:
+    c0 = cl.eval(0.0).reshape(3)
+    t0 = cl.tangent(0.0).reshape(3)
+    g = np.asarray(mesh.vertices, float).mean(axis=0)
+    v = g - c0
+    v = v - (v @ t0) * t0
+    n = np.linalg.norm(v)
+    return None if n < 1e-12 else (v / n)
 
 
 def _fill_nan_circular(y: np.ndarray) -> np.ndarray:
@@ -50,6 +68,46 @@ def _fill_nan_circular(y: np.ndarray) -> np.ndarray:
     return y
 
 
+def _open_uniform_knots(
+    n_ctrl: int,
+    degree: int,
+    start: float = 0.0,
+    end: float = 1.0,
+) -> np.ndarray:
+    """Open-clamped uniform knot vector on ``[start, end]``."""
+    if n_ctrl < degree + 1:
+        raise ValueError("Number of control points must be >= degree + 1.")
+    start = float(start)
+    end = float(end)
+    n_int = max(n_ctrl - degree - 1, 0)
+    if n_int > 0:
+        interior = np.linspace(start, end, n_int + 2, dtype=float)[1:-1]
+    else:
+        interior = np.array([], dtype=float)
+    return np.concatenate(
+        [
+            np.full(degree + 1, start, dtype=float),
+            interior,
+            np.full(degree + 1, end, dtype=float),
+        ]
+    )
+
+
+def _bspline_basis_matrix(params: np.ndarray, knots: np.ndarray, degree: int) -> np.ndarray:
+    """Dense basis matrix B (N × n_basis) for evaluating a B-spline."""
+    params = np.asarray(params, dtype=float)
+    n_basis = len(knots) - degree - 1
+    if n_basis <= 0:
+        raise ValueError("Invalid knot vector for basis evaluation.")
+    basis = np.empty((params.size, n_basis), dtype=float)
+    for j in range(n_basis):
+        coeff = np.zeros(n_basis, dtype=float)
+        coeff[j] = 1.0
+        spline = BSpline(knots, coeff, degree, extrapolate=False)
+        basis[:, j] = spline(params)
+    return basis
+
+
 def fit_radius_surface(
     mesh: Mesh3D,
     centerline: CenterlineBSpline,
@@ -60,9 +118,11 @@ def fit_radius_surface(
     tau_samples: Optional[int] = None,
     *,
     theta_anchor: str = "rho_argmax",
+    theta_periodic: bool = True,
+    regularization: float = 1e-10,
 ) -> Tuple[RadiusSurfaceBSpline, float, float]:
     """
-    Fit bicubic ρ_w(τ,θ) with θ seam handling using LSQBivariateSpline.
+    Fit bicubic ρ_w(τ,θ) with θ seam handling via tensor-product LSQ splines.
 
     Parameters
     ----------
@@ -76,6 +136,10 @@ def fit_radius_surface(
         Number of θ samples for ray casting (default = R*8, >= R*4).
     tau_samples : int | None
         Number of τ samples for ray casting (default = max(5*K, 80)).
+    theta_periodic : bool
+        If True, fit periodic cubic basis in θ; otherwise use open-clamped basis.
+    regularization : float
+        Ridge parameter added to normal equations for numerical stability.
 
     Returns
     -------
@@ -101,7 +165,9 @@ def fit_radius_surface(
     Z = np.empty((tau_samples, thetas), dtype=float)
     Z[:] = np.nan
     # Offsets to try (in mm): small -> larger
-    bbox_diag = float(np.linalg.norm(np.array(mesh.vertices).ptp(axis=0)))
+    bbox_diag = float(
+        np.linalg.norm(np.ptp(np.asarray(mesh.vertices, dtype=float), axis=0))
+    )
     trial_offsets = [1e-6 * bbox_diag, 1e-4 * bbox_diag, 1e-3 * bbox_diag, 1e-2 * bbox_diag]
     for i, tau in enumerate(taus):
         d = None
@@ -187,7 +253,12 @@ def fit_radius_surface(
 
     # Quick diagnostics
     zv = Z[np.isfinite(Z)]
-    print(f"[fit_radius_surface] rho stats mm: min={zv.min():.3f}  median={np.median(zv):.3f}  max={zv.max():.3f}  (after clip)")
+    log.debug(
+        "rho stats mm: min=%.3f median=%.3f max=%.3f (after clip)",
+        zv.min(),
+        np.median(zv),
+        zv.max(),
+    )
 
     # Create **virtual boundary rows** to anchor τ=0 and τ=1 using the nearest sampled rows
     # This greatly stabilizes the ends without sampling through the caps.
@@ -196,46 +267,51 @@ def fit_radius_surface(
     taus_aug = np.r_[0.0, taus, 1.0]
     Z_aug = np.vstack([Z0, Z, Z1])
 
-    # Duplicate the θ seam for periodicity (θ=0 and θ=2π)
-    theta_dup = np.r_[theta_grid, 0.0, 2.0 * np.pi]
-    Z_dup = np.concatenate([Z_aug, Z_aug[:, :1], Z_aug[:, :1]], axis=1)
+    if not np.isfinite(Z_aug).all():
+        raise ValueError("Radius sampling produced NaNs after imputation; cannot fit spline.")
 
-    # Flatten to scattered points for LSQ fit
-    TT = np.repeat(taus_aug, theta_dup.size)
-    TH = np.tile(theta_dup, taus_aug.size)
-    ZZ = Z_dup.reshape(-1)
+    # Build tensor-product basis matrices
+    knots_tau = _open_uniform_knots(K, kx, start=0.0, end=1.0)
+    Btau = _bspline_basis_matrix(taus_aug, knots_tau, kx)
 
-    # Remove any residual NaNs just in case
-    m = np.isfinite(ZZ)
-    TT, TH, ZZ = TT[m], TH[m], ZZ[m]
+    if theta_periodic:
+        Btheta, knots_theta = periodic_theta_basis_matrix(
+            theta_grid,
+            R,
+            start=0.0,
+            end=TWO_PI,
+            degree=ky,
+        )
+        n_theta_ctrl = R
+    else:
+        knots_theta = _open_uniform_knots(R, ky, start=0.0, end=TWO_PI)
+        Btheta = _bspline_basis_matrix(theta_grid, knots_theta, ky)
+        n_theta_ctrl = Btheta.shape[1]
 
-    # Interior knots (strictly inside)
-    n_int_tau = max(K - (kx + 1), 0)
-    tx_int = np.linspace(0.0, 1.0, n_int_tau + 2, dtype=float)[1:-1] if n_int_tau > 0 else np.array([], float)
+    lam = max(float(regularization), 0.0)
+    Gtau = Btau.T @ Btau + lam * np.eye(Btau.shape[1])
+    Gtheta = Btheta.T @ Btheta + lam * np.eye(Btheta.shape[1])
+    RHS = Btau.T @ Z_aug @ Btheta
 
-    n_int_th = max(R - (ky + 1), 0)
-    ty_int = np.linspace(0.0, 2.0 * np.pi, n_int_th + 2, dtype=float)[1:-1] if n_int_th > 0 else np.array([], float)
+    system = np.kron(Gtheta.T, Gtau)
+    rhs = RHS.reshape(-1, order="F")
+    coeff_vec = np.linalg.solve(system, rhs)
+    coeffs_core = coeff_vec.reshape((Btau.shape[1], n_theta_ctrl), order="F")
 
-    # Fit LSQ bicubic with domain bbox fixed to [0,1]×[0,2π]
-    spl = LSQBivariateSpline(TT, TH, ZZ, tx_int, ty_int, kx=kx, ky=ky, bbox=[0.0, 1.0, 0.0, 2.0 * np.pi])
-
-    # Extract full knot vectors and coefficients
-    tx_full, ty_full = spl.get_knots()          # full open-clamped knots incl. boundaries
-    Nx = len(tx_full) - kx - 1                  # number of basis functions along τ
-    Ny = len(ty_full) - ky - 1                  # number of basis functions along θ
-    coeffs_flat = spl.get_coeffs()
-    coeffs = coeffs_flat.reshape((Nx, Ny), order="F")  # FITPACK uses Fortran order
+    if theta_periodic:
+        wrap = ky
+        coeffs = np.concatenate([coeffs_core[:, -wrap:], coeffs_core], axis=1)
+    else:
+        coeffs = coeffs_core
 
     rs = RadiusSurfaceBSpline(
         k_tau=kx,
         k_theta=ky,
-        knots_tau=tx_full.astype(float),
-        knots_theta=ty_full.astype(float),
+        knots_tau=knots_tau.astype(float),
+        knots_theta=knots_theta.astype(float),
         coeffs=coeffs.astype(float),
-        theta_periodic=True,
+        theta_periodic=bool(theta_periodic),
     )
-    # Attach the SciPy object for efficient evaluation
-    setattr(rs, "_spl", spl)
     return rs, tau_margin, float(theta_offset)
 
 
@@ -276,7 +352,17 @@ def build_model(mesh: Mesh3D, params: Optional[Dict[str, Any]] = None) -> VCSMod
     rays_tau_samples = params.get("rays_tau_samples", None)
     unit_scale = float(params.get("unit_scale", 1.0))
     pad_len = params.get("pad_ends_mm", None)
-    theta_anchor = str(params.get("theta_anchor", "rho_argmax")).strip().lower()
+    theta_anchor = str(params.get("theta_anchor", "none")).strip().lower()
+    theta_periodic_raw = params.get("theta_periodic", True)
+    if isinstance(theta_periodic_raw, str):
+        theta_periodic = theta_periodic_raw.strip().lower() not in {"0", "false", "off", "no"}
+    else:
+        theta_periodic = bool(theta_periodic_raw)
+    theta_lambda_raw = params.get("theta_periodic_lambda", 1e-10)
+    try:
+        theta_lambda = float(theta_lambda_raw)
+    except (TypeError, ValueError):
+        theta_lambda = 1e-10
 
     # Optional unit scaling (e.g., cm->mm => 10.0)
     if unit_scale != 1.0:
@@ -304,7 +390,22 @@ def build_model(mesh: Mesh3D, params: Optional[Dict[str, Any]] = None) -> VCSMod
     cl = fit_centerline_bspline(pl, L=L, constant_speed=True)
 
     # RMF
-    rmf = compute_rmf(cl, step_mm=1.0)
+    v1_0 = _v1_from_mesh_centroid(cl, mesh_for_encoding)
+    rmf = compute_rmf(cl, step_mm=1.0, init_v1=v1_0)
+
+    # Optional Ω uniqueness check (paper Section 4)
+    try:
+        if check_tau_uniqueness is None:
+            raise RuntimeError("checks unavailable")
+        omega = check_tau_uniqueness(cl, mesh_for_encoding)
+        if omega["violations_frac"] > 0.0:
+            log.warning(
+                "VCS Ω uniqueness violated for %.2f%% of sampled vertices (max rho/R=%.3f)",
+                100.0 * omega["violations_frac"],
+                omega["max_ratio"],
+            )
+    except Exception as e:
+        log.debug("Ω check skipped: %r", e)
 
     # ρ_w(τ,θ) fit
     anchor_mode = "none" if theta_anchor in {"none", "off", "false"} else "rho_argmax"
@@ -317,6 +418,8 @@ def build_model(mesh: Mesh3D, params: Optional[Dict[str, Any]] = None) -> VCSMod
         thetas=rays_thetas,
         tau_samples=rays_tau_samples,
         theta_anchor=anchor_mode,
+        theta_periodic=theta_periodic,
+        regularization=theta_lambda,
     )
 
     # Metadata for reproducibility and reversibility
@@ -330,12 +433,16 @@ def build_model(mesh: Mesh3D, params: Optional[Dict[str, Any]] = None) -> VCSMod
         "R": R,
         "knots_tau": rs.knots_tau.tolist(),
         "knots_theta": rs.knots_theta.tolist(),
-        "theta_periodic": True,
+        "theta_periodic": bool(theta_periodic),
+        "theta_basis": "bspline_cubic_periodic" if theta_periodic else "bspline_cubic_open",
+        "theta_regularization": float(theta_lambda),
         "tau_param": "arc-length",
         "tau_margin": float(tau_margin),
         "pad_ends_mm": None if (pad_len is None or float(pad_len) == 0.0) else float(pad_len),
         "theta_anchor": anchor_mode,
         "theta_offset": float(theta_offset),
+        "rmf_v1_0": None if v1_0 is None else np.asarray(v1_0, float).tolist(),
+        "rmf_step_mm": 1.0,
         "seed_offset_mm_deprecated": seed_offset,
         "cap_planes": [
             {

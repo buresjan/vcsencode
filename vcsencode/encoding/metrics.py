@@ -79,8 +79,10 @@ def residuals(
         N = V.shape[0]
 
     # RMF along the curve with ~1 mm sampling (derived from curve length)
-    step_mm = max(model.centerline.length() / 1000.0, 1e-3)
-    rmf = compute_rmf(model.centerline, step_mm=step_mm)
+    step_mm = float(model.meta.get("rmf_step_mm", max(model.centerline.length() / 1000.0, 1e-3)))
+    v1_0 = model.meta.get("rmf_v1_0", None)
+    init_v1 = None if v1_0 is None else np.asarray(v1_0, float)
+    rmf = compute_rmf(model.centerline, step_mm=step_mm, init_v1=init_v1)
 
     tau_arr = np.empty(N, dtype=float)
     th_arr = np.empty(N, dtype=float)

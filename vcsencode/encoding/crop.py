@@ -75,5 +75,7 @@ def crop_and_refit(model: VCSModel, tau0: float, tau1: float, *,
     meta["crop_tau1"] = float(tau1)
     meta["knots_tau"] = tx_full.tolist()
     meta["knots_theta"] = ty_full.tolist()
+    # Recompute tau_margin consistent with forward fit definition
+    meta["tau_margin"] = float(1.0 / (float(tau_samples) * 10.0))
 
     return VCSModel(centerline=cl_new, radius=rs_new, meta=meta)

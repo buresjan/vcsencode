@@ -98,6 +98,7 @@ def compute_rmf(
     init_rule: str = "centroid-plane",
     method: str = "double_reflection",
     step_mm: float = 1.0,
+    init_v1: np.ndarray | None = None,
 ) -> RMF:
     """
     Compute a Rotation-Minimizing Frame (RMF) along the centerline using the
@@ -109,6 +110,7 @@ def compute_rmf(
                    orthogonal to t(0) and projects it to the normal plane.
         method: only 'double_reflection' is implemented.
         step_mm: target arc-length step for sampling.
+        init_v1: optional user-specified initial v1(0); projected to normal plane.
 
     Returns:
         RMF with callables t(τ), v1(τ), v2(τ).
@@ -124,7 +126,15 @@ def compute_rmf(
 
     # Initial frame U0 = (r0, s0, t0)
     t0 = T[0]
-    r0 = _choose_initial_normal(t0, rule=init_rule)
+    if init_v1 is not None:
+        r0 = np.asarray(init_v1, dtype=np.float64).reshape(3)
+        r0 = r0 - (r0 @ t0) * t0
+        if np.linalg.norm(r0) < 1e-12:
+            r0 = _choose_initial_normal(t0, rule=init_rule)
+        else:
+            r0 = _normalize(r0)
+    else:
+        r0 = _choose_initial_normal(t0, rule=init_rule)
     s0 = np.cross(t0, r0); s0 = _normalize(s0)
     r0 = np.cross(s0, t0); r0 = _normalize(r0)
 

@@ -49,8 +49,10 @@ def _grid_vertices(model: VCSModel, n_tau: int, n_theta: int) -> np.ndarray:
     TH = np.linspace(0.0, 2.0 * np.pi, int(n_theta), endpoint=False, dtype=float)
 
     # Frame evaluated along T
-    step_mm = max(cl.length() / max(n_tau - 1, 1), 1e-3)
-    rmf = compute_rmf(cl, step_mm=step_mm)
+    step_mm = float(model.meta.get("rmf_step_mm", max(cl.length() / max(n_tau - 1, 1), 1e-3)))
+    v1_0 = model.meta.get("rmf_v1_0", None)
+    init_v1 = None if v1_0 is None else np.asarray(v1_0, float)
+    rmf = compute_rmf(cl, step_mm=step_mm, init_v1=init_v1)
     C = cl.eval(T)               # (n_tau, 3)
     V1 = rmf.v1(T)               # (n_tau, 3)
     V2 = rmf.v2(T)               # (n_tau, 3)
@@ -313,19 +315,7 @@ def _cap_from_wall_autoslice(wall: Mesh3D, center: np.ndarray, normal: np.ndarra
     return Mesh3D(vertices=Vcap, faces=Fcap, units=wall.units)
 
 
-def _plane_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return orthonormal (u, v, n) given a plane normal n."""
-    n = np.asarray(normal, dtype=float).reshape(3)
-    n = n / (np.linalg.norm(n) + 1e-12)
-    # pick an arbitrary vector least aligned with n
-    a = np.array([1.0, 0.0, 0.0], dtype=float)
-    if abs(np.dot(a, n)) > 0.9:
-        a = np.array([0.0, 1.0, 0.0], dtype=float)
-    u = a - np.dot(a, n) * n
-    u = u / (np.linalg.norm(u) + 1e-12)
-    v = np.cross(n, u)
-    v = v / (np.linalg.norm(v) + 1e-12)
-    return u, v, n
+# (duplicate _plane_basis removed; using the one defined above in autoslice helpers)
 
 
 def cap_meshes(model: VCSModel, n_theta: int = 256) -> Mesh3D:

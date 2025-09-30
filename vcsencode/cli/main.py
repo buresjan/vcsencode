@@ -53,6 +53,10 @@ def _add_encode_arguments(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--rays-tau-samples", type=int, default=240, help="Tau samples for radius casting.")
     sub.add_argument("--rmf-step-mm", type=float, default=0.5, help="Step size (mm) for RMF sampling (reserved).")
     sub.add_argument("--theta-anchor", default="rho_argmax", choices=["rho_argmax", "none"], help="Deterministic theta anchoring strategy.")
+    sub.add_argument("--theta-periodic", dest="theta_periodic", action="store_true", help="Use periodic cubic B-spline in theta.")
+    sub.add_argument("--no-theta-periodic", dest="theta_periodic", action="store_false", help="Disable periodic theta spline (use open-clamped basis).")
+    sub.set_defaults(theta_periodic=True)
+    sub.add_argument("--theta-periodic-lambda", type=float, default=1e-10, help="Regularization for periodic theta fit (ridge term).")
     sub.add_argument("--clip-percentile", type=float, default=99.5, help="High-percentile clipping for radius samples.")
     sub.add_argument("--clip-hi-factor", type=float, default=3.0, help="Median-based clipping factor for radius samples.")
     sub.add_argument("--clip-enable", dest="clip_enable", action="store_true", help="Enable clipping of outlier radii.")
@@ -113,6 +117,8 @@ def _run_encode(args: argparse.Namespace) -> None:
         "rays_tau_samples": int(args.rays_tau_samples),
         "rmf_step_mm": float(args.rmf_step_mm),
         "theta_anchor": args.theta_anchor,
+        "theta_periodic": bool(args.theta_periodic),
+        "theta_periodic_lambda": float(args.theta_periodic_lambda),
         "clip_enable": bool(args.clip_enable),
         "clip_percentile": float(args.clip_percentile),
         "clip_hi_factor": float(args.clip_hi_factor),
