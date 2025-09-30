@@ -1,0 +1,31 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dylib
+*.DS_Store
+
+# Virtual envs / build
+.env/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Editors
+.vscode/
+.idea/
+
+# Data / outputs
+*.npy
+*.npz
+*.vtp
+*.vtu
+*.stl
+*.png
+*.svg
+*.eps
+*.pdf
+*.txt

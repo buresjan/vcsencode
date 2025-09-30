@@ -1,0 +1,27 @@
+name: vcsencode
+channels:
+  - conda-forge
+  - vmtk
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - vtk
+  - vmtk
+  - pyvista
+  - matplotlib
+  - trimesh
+  - embree
+  - pyembree
+  - shapely
+  - rtree
+  - rich
+  - pip
+  - pip:
+      - typer[all]
+      - black
+      - ruff
+      - pytest
+      - pytest-cov
+      - pre-commit
+      # trimesh extras also available via pip; retained base conda install above for stability
